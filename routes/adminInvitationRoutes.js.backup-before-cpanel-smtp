@@ -1,0 +1,370 @@
+const express = require('express');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+
+const router = express.Router();
+const db = require('../config/db');
+const sendEmail = require('../utils/sendEmail');
+
+const {
+  verifyToken,
+  verifyAdmin
+} = require('../middleware/authMiddleware');
+
+
+// CREATE ADMIN / EDITOR INVITATION
+router.post(
+  '/',
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+
+    const { name, email, role } = req.body;
+
+    if (!name || !email || !role) {
+      return res.status(400).json({
+        success: false,
+        message: 'Name, email and role are required'
+      });
+    }
+
+    if (!['admin', 'editor'].includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Role must be admin or editor'
+      });
+    }
+
+    try {
+
+      // Check whether the email already belongs to an admin/editor
+      db.query(
+        'SELECT id FROM admins WHERE email = ? LIMIT 1',
+        [email],
+        async (err, existingAdmins) => {
+
+          if (err) {
+            console.error(err);
+
+            return res.status(500).json({
+              success: false,
+              message: 'Database error'
+            });
+          }
+
+          if (existingAdmins.length > 0) {
+            return res.status(409).json({
+              success: false,
+              message: 'An account with this email already exists'
+            });
+          }
+
+          // Generate secure invitation token
+          const rawToken = crypto
+            .randomBytes(32)
+            .toString('hex');
+
+          // Store only the hash in the database
+          const tokenHash = crypto
+            .createHash('sha256')
+            .update(rawToken)
+            .digest('hex');
+
+          // Invitation expires in 24 hours
+          const expiresAt = new Date(
+            Date.now() + 24 * 60 * 60 * 1000
+          );
+
+          const sql = `
+            INSERT INTO admin_invitations
+            (
+              name,
+              email,
+              role,
+              token_hash,
+              expires_at,
+              created_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+          `;
+
+          db.query(
+            sql,
+            [
+              name,
+              email,
+              role,
+              tokenHash,
+              expiresAt,
+              req.user.id
+            ],
+            async (err, result) => {
+
+              if (err) {
+                console.error(
+                  'Invitation database error:',
+                  err
+                );
+
+                return res.status(500).json({
+                  success: false,
+                  message: 'Failed to create invitation'
+                });
+              }
+
+              /*
+               * Change this to your real frontend URL
+               * when the frontend is deployed.
+               */
+             const invitationLink =
+             `https://cocoabridge.com/admin/accept-invitation.html?token=${rawToken}`;
+
+              await sendEmail({
+                to: email,
+                subject: 'COCOABRIDGE Admin Invitation',
+                html: `
+                  <h2>COCOABRIDGE Invitation</h2>
+
+                  <p>Hello ${name},</p>
+
+                  <p>
+                    You have been invited to join the
+                    COCOABRIDGE administration system as a
+                    <strong>${role}</strong>.
+                  </p>
+
+                  <p>
+                    Click the button below to create your password
+                    and activate your account:
+                  </p>
+
+                  <p>
+                    <a href="${invitationLink}">
+                      Accept Invitation
+                    </a>
+                  </p>
+
+                  <p>
+                    This invitation will expire in 24 hours.
+                  </p>
+
+                  <p>
+                    If you did not expect this invitation,
+                    you can ignore this email.
+                  </p>
+                `
+              });
+
+              return res.status(201).json({
+                success: true,
+                message: 'Invitation created successfully',
+                invitationId: result.insertId,
+                invitationLink
+              });
+
+            }
+          );
+
+        }
+      );
+
+    } catch (error) {
+
+      console.error(
+        'Invitation error:',
+        error
+      );
+
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to create invitation'
+      });
+
+    }
+  }
+);
+
+
+// ACCEPT INVITATION
+router.post(
+  '/accept',
+  async (req, res) => {
+
+    const {
+      token,
+      password
+    } = req.body;
+
+    if (!token || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Token and password are required'
+      });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 8 characters'
+      });
+    }
+
+    const tokenHash = crypto
+      .createHash('sha256')
+      .update(token)
+      .digest('hex');
+
+    db.query(
+      `
+        SELECT *
+        FROM admin_invitations
+        WHERE token_hash = ?
+          AND accepted_at IS NULL
+        LIMIT 1
+      `,
+      [tokenHash],
+      async (err, invitations) => {
+
+        if (err) {
+          console.error(err);
+
+          return res.status(500).json({
+            success: false,
+            message: 'Database error'
+          });
+        }
+
+        if (!invitations.length) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invalid or already used invitation'
+          });
+        }
+
+        const invitation = invitations[0];
+
+        if (
+          new Date() >
+          new Date(invitation.expires_at)
+        ) {
+          return res.status(400).json({
+            success: false,
+            message: 'Invitation has expired'
+          });
+        }
+
+        const hashedPassword =
+          await bcrypt.hash(password, 10);
+
+        db.query(
+          `
+            INSERT INTO admins
+            (
+              name,
+              email,
+              password,
+              role
+            )
+            VALUES (?, ?, ?, ?)
+          `,
+          [
+            invitation.name,
+            invitation.email,
+            hashedPassword,
+            invitation.role
+          ],
+          (err, result) => {
+
+            if (err) {
+              console.error(
+                'Account creation error:',
+                err
+              );
+
+              return res.status(500).json({
+                success: false,
+                message: 'Failed to create account'
+              });
+            }
+
+            db.query(
+              `
+                UPDATE admin_invitations
+                SET accepted_at = NOW()
+                WHERE id = ?
+              `,
+              [invitation.id],
+              (err) => {
+
+                if (err) {
+                  console.error(
+                    'Invitation update error:',
+                    err
+                  );
+                }
+
+                return res.json({
+                  success: true,
+                  message:
+                    'Account created successfully'
+                });
+
+              }
+            );
+
+          }
+        );
+
+      }
+    );
+
+  }
+);
+
+
+// GET ALL ADMIN / EDITOR USERS
+router.get(
+  '/users',
+  verifyToken,
+  verifyAdmin,
+  (req, res) => {
+
+    db.query(
+      `
+        SELECT
+          id,
+          name,
+          email,
+          role,
+          created_at
+        FROM admins
+        ORDER BY id DESC
+      `,
+      (err, users) => {
+
+        if (err) {
+          console.error(
+            'Users database error:',
+            err
+          );
+
+          return res.status(500).json({
+            success: false,
+            message: 'Database error'
+          });
+        }
+
+        return res.json({
+          success: true,
+          count: users.length,
+          users
+        });
+
+      }
+    );
+
+  }
+);
+
+
+module.exports = router;

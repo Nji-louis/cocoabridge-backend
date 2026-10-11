@@ -1,0 +1,476 @@
+const express = require("express");
+const multer = require("multer");
+const path = require("path");
+const fs = require("fs");
+const db = require("../config/db");
+
+const router = express.Router();
+
+// =====================================================
+// GALLERY IMAGE UPLOAD CONFIGURATION
+// =====================================================
+
+const galleryUploadDir = path.join(
+  __dirname,
+  "..",
+  "uploads",
+  "gallery"
+);
+
+if (!fs.existsSync(galleryUploadDir)) {
+  fs.mkdirSync(galleryUploadDir, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, galleryUploadDir);
+  },
+
+  filename: (req, file, cb) => {
+    const extension = path.extname(file.originalname).toLowerCase();
+
+    const safeName = path
+      .basename(file.originalname, extension)
+      .replace(/[^a-zA-Z0-9-_]/g, "-")
+      .toLowerCase();
+
+    cb(
+      null,
+      `${Date.now()}-${safeName}${extension}`
+    );
+  }
+});
+
+const fileFilter = (req, file, cb) => {
+  const allowedTypes = [
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+    "image/gif"
+  ];
+
+  if (allowedTypes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(
+      new Error(
+        "Invalid image format. Only JPG, JPEG, PNG, WEBP and GIF are allowed."
+      )
+    );
+  }
+};
+
+const upload = multer({
+  storage,
+  fileFilter,
+  limits: {
+    fileSize: 10 * 1024 * 1024
+  }
+});
+
+// =====================================================
+// DELETE GALLERY IMAGE FROM DISK
+// =====================================================
+
+function deleteGalleryImage(imageUrl) {
+  if (!imageUrl) return;
+
+  if (!imageUrl.startsWith("/uploads/gallery/")) {
+    return;
+  }
+
+  const filename = path.basename(imageUrl);
+  const filePath = path.join(
+    galleryUploadDir,
+    filename
+  );
+
+  if (fs.existsSync(filePath)) {
+    fs.unlinkSync(filePath);
+  }
+}
+
+// =====================================================
+// GET ALL GALLERY ITEMS
+// =====================================================
+
+router.get("/", (req, res) => {
+  const sql = `
+    SELECT
+      id,
+      title,
+      category,
+      image_url,
+      description,
+      featured,
+      status,
+      created_at
+    FROM gallery
+    ORDER BY created_at DESC
+  `;
+
+  db.query(sql, (err, results) => {
+    if (err) {
+      console.error("GET GALLERY ERROR:", err);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to load gallery."
+      });
+    }
+
+    res.json({
+      success: true,
+      count: results.length,
+      gallery: results
+    });
+  });
+});
+
+// =====================================================
+// CREATE GALLERY ITEM
+// =====================================================
+
+router.post("/", upload.single("image"), (req, res) => {
+  const {
+    title,
+    category,
+    description,
+    featured,
+    status
+  } = req.body;
+
+  if (!title || !title.trim()) {
+    if (req.file) {
+      deleteGalleryImage(
+        `/uploads/gallery/${req.file.filename}`
+      );
+    }
+
+    return res.status(400).json({
+      success: false,
+      message: "Gallery title is required."
+    });
+  }
+
+  if (!req.file) {
+    return res.status(400).json({
+      success: false,
+      message: "Gallery image is required."
+    });
+  }
+
+  const imageUrl =
+    `/uploads/gallery/${req.file.filename}`;
+
+  const sql = `
+    INSERT INTO gallery
+      (
+        title,
+        category,
+        image_url,
+        description,
+        featured,
+        status
+      )
+    VALUES (?, ?, ?, ?, ?, ?)
+  `;
+
+  const values = [
+    title.trim(),
+    category && category.trim()
+      ? category.trim()
+      : "General",
+    imageUrl,
+    description && description.trim()
+      ? description.trim()
+      : null,
+    featured === "1" || featured === 1 || featured === true ? 1 : 0,
+    status === "inactive"
+      ? "inactive"
+      : "active"
+  ];
+
+  db.query(sql, values, (err, result) => {
+    if (err) {
+      console.error("CREATE GALLERY ERROR:", err);
+
+      deleteGalleryImage(imageUrl);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to create gallery item."
+      });
+    }
+
+    res.status(201).json({
+      success: true,
+      message: "Gallery image uploaded successfully.",
+      gallery: {
+        id: result.insertId,
+        title: title.trim(),
+        category:
+          category && category.trim()
+            ? category.trim()
+            : "General",
+        image_url: imageUrl,
+        description:
+          description && description.trim()
+            ? description.trim()
+            : null,
+        featured: featured === "1" || featured === 1 || featured === true ? 1 : 0,
+        status:
+          status === "inactive"
+            ? "inactive"
+            : "active"
+      }
+    });
+  });
+});
+
+// =====================================================
+// UPDATE GALLERY ITEM
+// =====================================================
+
+router.put("/:id", upload.single("image"), (req, res) => {
+  const { id } = req.params;
+
+  const {
+    title,
+    category,
+    description,
+    featured,
+    status
+  } = req.body;
+
+  const findSql = `
+    SELECT *
+    FROM gallery
+    WHERE id = ?
+  `;
+
+  db.query(findSql, [id], (err, rows) => {
+    if (err) {
+      console.error("FIND GALLERY ERROR:", err);
+
+      if (req.file) {
+        deleteGalleryImage(
+          `/uploads/gallery/${req.file.filename}`
+        );
+      }
+
+      return res.status(500).json({
+        success: false,
+        message: "Database error."
+      });
+    }
+
+    if (!rows.length) {
+      if (req.file) {
+        deleteGalleryImage(
+          `/uploads/gallery/${req.file.filename}`
+        );
+      }
+
+      return res.status(404).json({
+        success: false,
+        message: "Gallery item not found."
+      });
+    }
+
+    if (!title || !title.trim()) {
+      if (req.file) {
+        deleteGalleryImage(
+          `/uploads/gallery/${req.file.filename}`
+        );
+      }
+
+      return res.status(400).json({
+        success: false,
+        message: "Gallery title is required."
+      });
+    }
+
+    const existing = rows[0];
+
+    let imageUrl = existing.image_url;
+
+    if (req.file) {
+      imageUrl =
+        `/uploads/gallery/${req.file.filename}`;
+    }
+
+    const updateSql = `
+      UPDATE gallery
+      SET
+        title = ?,
+        category = ?,
+        image_url = ?,
+        description = ?,
+        featured = ?,
+        status = ?
+      WHERE id = ?
+    `;
+
+    const values = [
+      title.trim(),
+      category && category.trim()
+        ? category.trim()
+        : "General",
+      imageUrl,
+      description && description.trim()
+        ? description.trim()
+        : null,
+      featured === "1" || featured === 1 || featured === true ? 1 : 0,
+      status === "inactive"
+        ? "inactive"
+        : "active",
+      id
+    ];
+
+    db.query(updateSql, values, (updateErr) => {
+      if (updateErr) {
+        console.error(
+          "UPDATE GALLERY ERROR:",
+          updateErr
+        );
+
+        if (req.file) {
+          deleteGalleryImage(imageUrl);
+        }
+
+        return res.status(500).json({
+          success: false,
+          message: "Failed to update gallery item."
+        });
+      }
+
+      if (
+        req.file &&
+        existing.image_url !== imageUrl
+      ) {
+        deleteGalleryImage(existing.image_url);
+      }
+
+      res.json({
+        success: true,
+        message: "Gallery item updated successfully.",
+        gallery: {
+          id: Number(id),
+          title: title.trim(),
+          category:
+            category && category.trim()
+              ? category.trim()
+              : "General",
+          image_url: imageUrl,
+          description:
+            description && description.trim()
+              ? description.trim()
+              : null,
+          featured: featured === "1" || featured === 1 || featured === true ? 1 : 0,
+          status:
+            status === "inactive"
+              ? "inactive"
+              : "active"
+        }
+      });
+    });
+  });
+});
+
+// =====================================================
+// DELETE GALLERY ITEM
+// =====================================================
+
+router.delete("/:id", (req, res) => {
+  const { id } = req.params;
+
+  const findSql = `
+    SELECT image_url
+    FROM gallery
+    WHERE id = ?
+  `;
+
+  db.query(findSql, [id], (err, rows) => {
+    if (err) {
+      console.error(
+        "FIND DELETE GALLERY ERROR:",
+        err
+      );
+
+      return res.status(500).json({
+        success: false,
+        message: "Database error."
+      });
+    }
+
+    if (!rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Gallery item not found."
+      });
+    }
+
+    const imageUrl = rows[0].image_url;
+
+    const deleteSql = `
+      DELETE FROM gallery
+      WHERE id = ?
+    `;
+
+    db.query(deleteSql, [id], (deleteErr) => {
+      if (deleteErr) {
+        console.error(
+          "DELETE GALLERY ERROR:",
+          deleteErr
+        );
+
+        return res.status(500).json({
+          success: false,
+          message: "Failed to delete gallery item."
+        });
+      }
+
+      deleteGalleryImage(imageUrl);
+
+      res.json({
+        success: true,
+        message: "Gallery item deleted successfully."
+      });
+    });
+  });
+});
+
+// =====================================================
+// UPLOAD ERROR HANDLER
+// =====================================================
+
+router.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Image is too large. Maximum size is 10MB."
+      });
+    }
+
+    return res.status(400).json({
+      success: false,
+      message: error.message
+    });
+  }
+
+  if (error) {
+    return res.status(400).json({
+      success: false,
+      message:
+        error.message || "Image upload failed."
+    });
+  }
+
+  next();
+});
+
+module.exports = router;
