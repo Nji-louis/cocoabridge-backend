@@ -37,6 +37,7 @@ router.post('/', verifyToken, (req, res) => {
     short_description,
     description,
     image_url,
+    video_url,
     origin_country,
     packaging,
     min_order,
