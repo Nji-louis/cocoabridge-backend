@@ -12,7 +12,7 @@
    *   is running.
    */
 
-  const BACKEND_BASE_URL = 'http://localhost:5000';
+  const BACKEND_BASE_URL = 'https://api.cocoabridge.com';
 
   global.AppBackend = global.AppBackend || {};
 
